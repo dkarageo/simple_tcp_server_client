@@ -12,7 +12,6 @@
  *      -port : Port number on which to start the server.
  */
 
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,19 +21,36 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include "linked_list.h"
+
+
+typedef struct {
+    int fd;
+} handler_t;
 
 
 int init_listener(int port);
 void start_listener(int socket_fd);
 void destroy_listener(int socket_fd);
-void handle_client(int client_fd, struct sockaddr_in client_addr);
+void handle_client(int client_fd, struct sockaddr_in client_addr, node_t *node);
 void error(const char *msg);
 void terminate_server(int signum);
-void terminate_handler(int signum);
+void remove_handler(int signum, siginfo_t *info, void *cont);
 
 
-int listener_fd; // Handler of the listener connection (valid to listener).
-int handler_fd;  // Handler of the connection to client (valid to handlers).
+const int TERM_SIGNAL = SIGINT;  // Signal for requesting server termination.
+const int MAN_SIGNAL = SIGUSR1;  // Signal used for manipulating handler_fds.
+
+struct sigaction man_act;
+struct sigaction act;
+
+// Globals valid to listener process only.
+linked_list_t *handler_fds;   // Storage for info of active handlers.
+int listener_fd; // Handler of the listener connection.
+sigset_t *blocked_signals;  // Signals to block when manipulating handler_fds.
+
+// Globals valid to handlers processes only.
+int handler_fd;  // Handler of the connection to client.
 
 
 int main(int argc, char *argv[])
@@ -46,14 +62,48 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
+    // Initialize globals.
+    handler_fds = linked_list_create();
+    blocked_signals = (sigset_t *) malloc(sizeof(sigset_t));
+    sigemptyset(blocked_signals);
+    sigaddset(blocked_signals, MAN_SIGNAL);
+
     int port = atoi(argv[1]); // Listening port.
     listener_fd = init_listener(port);
 
-    signal(SIGINT, terminate_server);
+    // Install signal handler for list manipilation signal.
+    memset(&man_act, 0, sizeof(struct sigaction));
+    man_act.sa_sigaction = remove_handler;
+    man_act.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigaction(MAN_SIGNAL, &man_act, NULL);
+
+    // Install signal handler for terminating signal.
+    memset(&act, 0, sizeof(struct sigaction));
+    act.sa_handler = terminate_server;
+    sigaction(TERM_SIGNAL, &act, NULL);
     printf("Use CTRL+C to terminate.\n");
 
     // Use current process for the listener.
     start_listener(listener_fd);
+
+    printf("\nServer terminating...\n");
+
+    sigprocmask(SIG_BLOCK, blocked_signals, NULL);
+    iterator_t * iter = linked_list_iterator(handler_fds);
+    while(iterator_has_next(iter)) {
+        handler_t *handler = (handler_t *) iterator_next(iter);
+        shutdown(handler->fd, SHUT_RDWR);
+    }
+    iterator_destroy(iter);
+    sigprocmask(SIG_UNBLOCK, blocked_signals, NULL);
+
+    // Wait for all handler processes to complete.
+    int pid;
+    while((pid = wait(NULL)) > 0);
+
+    // Cleanup resources.
+    free(blocked_signals);
+    linked_list_destroy(handler_fds);
 
     return 0;
 }
@@ -75,25 +125,25 @@ void error(const char *msg)
  */
 void terminate_server(int signum)
 {
-    printf("\nServer terminating...\n");
-
     // Stop accepting new connections.
-    destroy_listener(listener_fd);
-
-    // Wait for all handler processes to complete.
-    int pid;
-    while((pid = wait(NULL)) > 0);
+    if (signum == TERM_SIGNAL) destroy_listener(listener_fd);
 }
 
 /**
- * Ask a handler process to terminate.
+ * Remove a handler from the list of active handlers.
  *
- * This is a signal handler that should be connected to the same terminating
- * signal terminate_server handler was connected to, on all handler processes.
+ * This is a signal handler for a signal that should be sent from each handler
+ * process just before it terminatess.
  */
-void terminate_handler(int signum)
+void remove_handler(int signum, siginfo_t *info, void *cont)
 {
-    shutdown(handler_fd, SHUT_RDWR);
+    if (signum == MAN_SIGNAL) {
+        printf("Removing handler...\n");
+        handler_t * handler = linked_list_remove(
+                handler_fds, info->si_value.sival_ptr);
+        close(handler->fd);  // Listener no more needs an open fd to client.
+        free(handler);
+    }
 }
 
 /**
@@ -137,17 +187,24 @@ void start_listener(int socket_fd)
                            (struct sockaddr *) &client_addr,
                            &sock_size)) > -1)
     {
+        // Add a new entry to handlers list.
+        handler_t *handler = malloc(sizeof(handler_t));
+        handler->fd = in_fd;
+        sigprocmask(SIG_BLOCK, blocked_signals, NULL);
+    	node_t *node = linked_list_append(handler_fds, (void *) handler);
+        sigprocmask(SIG_UNBLOCK, blocked_signals, NULL);
+
         int pid;
         if ((pid = fork()) == 0) {
+            close(socket_fd);
             // Handle the new client by a new process.
-            handle_client(in_fd, client_addr);
+            handle_client(in_fd, client_addr, node);
         }
         else if (pid == -1)  {
             error("ERROR: Failed to launch handler");
         }
-        else {
-            close(in_fd);  // On listener (parent) close this socket.
-        }
+        // Else: Do not close in_fd in parent process, Otherwise it will be
+        // impossible to shutdown() the connection.
     }
 }
 
@@ -162,10 +219,16 @@ void destroy_listener(int socket_fd)
 /**
  * Start the handler.
  */
-void handle_client(int client_fd, struct sockaddr_in client_addr)
+void handle_client(int client_fd, struct sockaddr_in client_addr, node_t *node)
 {
     // printf("New connection accepted. FD: %d\n", h_args->socket_fd);
-    signal(SIGINT, terminate_handler);
+
+    // Disable termination signal.
+    sigset_t sigs;
+    sigemptyset(&sigs);
+    sigaddset(&sigs, TERM_SIGNAL);
+    sigprocmask(SIG_BLOCK, &sigs, NULL);
+
     handler_fd = client_fd;
 
     // Initialize incoming message buffer.
@@ -179,12 +242,18 @@ void handle_client(int client_fd, struct sockaddr_in client_addr)
         memset(buffer, 0, 256);  // Clear the buffer for next incoming.
     }
 
+    // Signal parent process to treat this handler as dead.
+    union sigval val;
+    val.sival_ptr = (void *) node;
+    sigqueue(getppid(), MAN_SIGNAL, val);
+    // kill(getppid(), MAN_SIGNAL);
+
     // Close the connection to the client.
     close(client_fd);
 
     // Free local resources.
     free(buffer);
 
-    // printf("Connection closed.\n");
+    printf("Connection closed.\n");
     exit(0);
 }
