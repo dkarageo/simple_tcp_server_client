@@ -25,6 +25,7 @@ linked_list_t *linked_list_create()
 
     list->root = root;  // Set root node to the empty one.
     list->tail = root;
+	list->size = 0;
 
     return list;
 }
@@ -46,6 +47,8 @@ node_t *linked_list_append(linked_list_t *list, void *data)
 {
     node_t *node = (node_t *) malloc(sizeof(node_t));
 
+	list->size++;
+
     node->prev = list->tail;
     node->next = NULL;
     list->tail->next = node;
@@ -58,7 +61,9 @@ node_t *linked_list_append(linked_list_t *list, void *data)
 
 void *linked_list_remove(linked_list_t *list, node_t *node)
 {
-    void *data = node->data;
+	list->size--;
+
+	void *data = node->data;
 
     if (node->next != NULL) node->next->prev = node->prev;
     else list->tail = node->prev;
@@ -67,6 +72,11 @@ void *linked_list_remove(linked_list_t *list, node_t *node)
     free(node);
 
     return data;
+}
+
+int linked_list_size(linked_list_t *list)
+{
+    return list->size;
 }
 
 iterator_t *linked_list_iterator(linked_list_t *list)
