@@ -27,6 +27,7 @@
 typedef struct {
     int socket_fd;
     struct sockaddr_in addr;
+	node_t *list_entry;
 } handler_args_t;
 
 typedef struct {
@@ -44,10 +45,12 @@ void error(const char *msg);
 void terminate_server(int signum);
 
 
-linked_list_t *handler_fds;  // Storage for all socket descriptors of active
-                             // handlers.
-int listener_fd;             // Socket descriptor of listener.
-pthread_mutex_t *list_mutex; // A mutex used for list operations.
+const int TERM_SIGNAL = SIGINT;  // Signal for requesting server termination.
+
+linked_list_t *handler_fds;   // Storage for info of active handlers.
+int listener_fd;              // Socket descriptor of listener.
+pthread_mutex_t *list_mutex;  // A mutex used for list operations.
+pthread_cond_t *list_size_cond;  // Condition to be used for tracking handlers num.
 
 
 int main(int argc, char *argv[])
@@ -59,21 +62,52 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
+    // Initialize globals.
     handler_fds = linked_list_create();
     list_mutex = (pthread_mutex_t *) malloc(sizeof(pthread_mutex_t));
     pthread_mutex_init(list_mutex, NULL);
+	list_size_cond = (pthread_cond_t *) malloc(sizeof(pthread_cond_t));
+	pthread_cond_init(list_size_cond, NULL);
 
     int port = atoi(argv[1]); // Listening port.
     listener_fd = init_listener(port);
 
-    signal(SIGINT, terminate_server);
+    struct sigaction act;
+    memset(&act, 0, sizeof(act));
+    act.sa_handler = terminate_server;
+    sigaction(TERM_SIGNAL, &act, NULL);
     printf("Use CTRL+C to terminate.\n");
 
     // Use current thread for the listener.
     start_listener(listener_fd);
 
-    pthread_exit(0);  // Make sure that process terminates only when handlers
-                      // have terminated too
+    printf("\nServer terminating...\n");
+
+    // Ask active handlers to terminate.
+    pthread_mutex_lock(list_mutex);
+    iterator_t * iter = linked_list_iterator(handler_fds);
+    while(iterator_has_next(iter)) {
+        handler_t *handler = (handler_t *) iterator_next(iter);
+        shutdown(handler->fd, SHUT_RDWR);
+    }
+    iterator_destroy(iter);
+    pthread_mutex_unlock(list_mutex);
+
+    // Wait for previous active handlers to terminate (maybe already done so).
+    pthread_mutex_lock(list_mutex);
+	while (linked_list_size(handler_fds) > 0) {
+		pthread_cond_wait(list_size_cond, list_mutex);
+	}
+	pthread_mutex_unlock(list_mutex);
+
+    // Clean up resources.
+    pthread_mutex_destroy(list_mutex);
+    free(list_mutex);
+	pthread_cond_destroy(list_size_cond);
+	free(list_size_cond);
+    linked_list_destroy(handler_fds);
+
+    return 0;
 }
 
 /**
@@ -92,44 +126,7 @@ void error(const char *msg)
  */
 void terminate_server(int signum)
 {
-    printf("\nServer terminating...\n");
-
-    // Stop accepting new connections.
-    destroy_listener(listener_fd);
-
-    linked_list_t *tids = linked_list_create();  // Store handlers to wait for.
-
-    iterator_t *iter;
-
-    // Ask active handlers to terminate and extract their IDs.
-    pthread_mutex_lock(list_mutex);
-    iter = linked_list_iterator(handler_fds);
-    while(iterator_has_next(iter)) {
-        handler_t *handler = (handler_t *) iterator_next(iter);
-
-        // Shutdown the socket connection.
-        int rc = shutdown(handler->fd, SHUT_RDWR);
-        if (rc == -1) error("Connection shutdown error");
-
-        // Keep id for waiting later.
-        linked_list_append(tids, (void *) handler->tid);
-    }
-    iterator_destroy(iter);
-    pthread_mutex_unlock(list_mutex);
-
-    // Wait for previous active handlers to terminate (maybe already done so).
-    iter = linked_list_iterator(tids);
-    while(iterator_has_next(iter)) {
-        pthread_t tid = (pthread_t) iterator_next(iter);
-        pthread_join(tid, NULL);
-    }
-    iterator_destroy(iter);
-    linked_list_destroy(tids);
-
-    // Now globals can be destroyed safely.
-    pthread_mutex_destroy(list_mutex);
-    free(list_mutex);
-    linked_list_destroy(handler_fds);
+    if (signum == TERM_SIGNAL) destroy_listener(listener_fd);
 }
 
 /**
@@ -194,8 +191,31 @@ void handle_client(int client_fd, struct sockaddr_in client_addr)
     args->socket_fd = client_fd;
     args->addr = client_addr;
 
+    // New thread should be detached, since it's not gonna be joined.
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+	pthread_mutex_lock(list_mutex);
+
+	// Add new handler to the list of active handlers just to get a
+	// node reference.
+    handler_t *handler = malloc(sizeof(handler_t));
+	node_t *node = linked_list_append(handler_fds, (void *) handler);
+
+	args->list_entry = node;  // Pass node reference to new thread.
+
+	// Create new handler thread.
     pthread_t tid;
-    pthread_create(&tid, NULL, start_handler, (void *) args);
+    pthread_create(&tid, &attr, start_handler, (void *) args);
+
+	// Actually fill the handler object with tid value.
+    handler->tid = tid;
+    handler->fd = client_fd;
+
+	pthread_mutex_unlock(list_mutex);
+
+    pthread_attr_destroy(&attr);
 }
 
 /**
@@ -205,15 +225,6 @@ void *start_handler(void *args)
 {
     handler_args_t *h_args = (handler_args_t *) args;
     // printf("New connection accepted. FD: %d\n", h_args->socket_fd);
-
-    // Add self to the list of active handlers.
-    handler_t *handler = malloc(sizeof(handler_t));
-    handler->tid = pthread_self();
-    handler->fd = h_args->socket_fd;
-
-    pthread_mutex_lock(list_mutex);
-    node_t *node = linked_list_append(handler_fds, (void *) handler);
-    pthread_mutex_unlock(list_mutex);
 
     // Initialize incoming message buffer.
     char *buffer = (char *) malloc(sizeof(char) * 256);
@@ -228,9 +239,10 @@ void *start_handler(void *args)
 
     // Remove handler from list before terminating.
     pthread_mutex_lock(list_mutex);
-    handler = linked_list_remove(handler_fds, node);
+    handler_t *handler = linked_list_remove(handler_fds, h_args->list_entry);
     free(handler);  // Also keep in mutex, to properly handle server termination.
-    pthread_mutex_unlock(list_mutex);
+	pthread_cond_signal(list_size_cond);
+	pthread_mutex_unlock(list_mutex);
 
     // Finally, close the connection to the client.
     close(h_args->socket_fd);
