@@ -21,6 +21,7 @@ struct Node {
 typedef struct {
     node_t *root;
     node_t *tail;
+	int size;
 } linked_list_t;
 
 typedef struct {
@@ -33,6 +34,7 @@ linked_list_t *linked_list_create();
 void linked_list_destroy(linked_list_t *list);
 node_t *linked_list_append(linked_list_t *list, void *data);
 void *linked_list_remove(linked_list_t *list, node_t *node);
+int linked_list_size(linked_list_t *list);
 iterator_t *linked_list_iterator(linked_list_t *list);
 int iterator_has_next(iterator_t *iter);
 void *iterator_next(iterator_t *iter);
